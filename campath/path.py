@@ -25,6 +25,79 @@ class CameraPathError(ValueError):
     """Raised when camera-path input is invalid or geometrically degenerate."""
 
 
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _as_point(point, what="point"):
+    """Coerce ``point`` to a finite ``(x, y, z)`` tuple of floats."""
+    try:
+        x, y, z = point
+    except (TypeError, ValueError):
+        raise CameraPathError(f"{what} must be a 3-component vector: {point!r}")
+    x, y, z = float(x), float(y), float(z)
+    if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+        raise CameraPathError(f"{what} has a non-finite coordinate: {point!r}")
+    return (x, y, z)
+
+
+def _sub(a, b):
+    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+
+def _add(a, b):
+    return (a[0] + b[0], a[1] + b[1], a[2] + b[2])
+
+
+def _scale(a, s):
+    return (a[0] * s, a[1] * s, a[2] * s)
+
+
+def _dot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _cross(a, b):
+    return (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
+
+
+def _norm(a):
+    return math.sqrt(_dot(a, a))
+
+
+def _normalize(vec, what="vector"):
+    length = _norm(vec)
+    if length <= TOLERANCE:
+        raise CameraPathError(f"{what} is zero or near-zero and cannot be normalized")
+    return (vec[0] / length, vec[1] / length, vec[2] / length)
+
+
+def _check_points(points, what="control points"):
+    """Shared validation for control-point sequences. Returns coerced list."""
+    coerced = [_as_point(p, what="control point") for p in points]
+    if len(coerced) < 2:
+        raise CameraPathError(
+            f"{what}: fewer than two control points ({len(coerced)} given)"
+        )
+    for i in range(len(coerced)):
+        for j in range(i + 1, len(coerced)):
+            if _norm(_sub(coerced[i], coerced[j])) <= TOLERANCE:
+                raise CameraPathError(
+                    f"{what}: duplicate control points at indices {i} and {j}"
+                )
+    return coerced
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
 def catmull_rom(points, samples):
     """Sample a Catmull-Rom spline through ``points``.
 
@@ -38,7 +111,46 @@ def catmull_rom(points, samples):
     points, when any coordinate is not finite, or when two control points are
     duplicates within ``1e-6``.
     """
-    raise NotImplementedError("catmull_rom is not implemented yet")
+    pts = _check_points(points)
+    if not isinstance(samples, int) or isinstance(samples, bool) or samples < 2:
+        raise CameraPathError(f"samples must be an integer of at least 2, got {samples!r}")
+
+    n = len(pts)
+    # Mirrored phantom endpoints keep the endpoint tangents non-zero.
+    extended = (
+        [_sub(_scale(pts[0], 2.0), pts[1])]
+        + list(pts)
+        + [_sub(_scale(pts[-1], 2.0), pts[-2])]
+    )
+
+    segments = n - 1
+    result = []
+    for s in range(samples):
+        t_global = s * segments / (samples - 1)
+        seg = min(int(t_global), segments - 1)
+        t = t_global - seg
+        p0 = extended[seg]
+        p1 = extended[seg + 1]
+        p2 = extended[seg + 2]
+        p3 = extended[seg + 3]
+        t2 = t * t
+        t3 = t2 * t
+        position = tuple(
+            0.5
+            * (
+                2.0 * p1[c]
+                + (-p0[c] + p2[c]) * t
+                + (2.0 * p0[c] - 5.0 * p1[c] + 4.0 * p2[c] - p3[c]) * t2
+                + (-p0[c] + 3.0 * p1[c] - 3.0 * p2[c] + p3[c]) * t3
+            )
+            for c in range(3)
+        )
+        result.append(position)
+
+    # Snap the ends to the exact control points.
+    result[0] = pts[0]
+    result[-1] = pts[-1]
+    return result
 
 
 def tangent_at(samples, index):
@@ -52,7 +164,28 @@ def tangent_at(samples, index):
     Raises :class:`CameraPathError` when ``index`` is out of range, when there
     are fewer than two samples, or when the difference vector is zero.
     """
-    raise NotImplementedError("tangent_at is not implemented yet")
+    pts = [_as_point(p, what="sample") for p in samples]
+    if len(pts) < 2:
+        raise CameraPathError(
+            f"tangent_at needs at least two samples, got {len(pts)}"
+        )
+    if not isinstance(index, int) or isinstance(index, bool):
+        raise CameraPathError(f"index must be an integer, got {index!r}")
+    if index < 0:
+        index += len(pts)
+    if index < 0 or index >= len(pts):
+        raise CameraPathError(
+            f"index {index} out of range for {len(pts)} samples"
+        )
+
+    if index == 0:
+        diff = _sub(pts[1], pts[0])
+    elif index == len(pts) - 1:
+        diff = _sub(pts[-1], pts[-2])
+    else:
+        diff = _sub(pts[index + 1], pts[index - 1])
+
+    return _normalize(diff, what="tangent difference")
 
 
 def look_at(pos, target, up):
@@ -73,7 +206,30 @@ def look_at(pos, target, up):
     Raises :class:`CameraPathError` when ``pos`` and ``target`` coincide or
     when ``up`` is parallel to ``forward`` (singular basis).
     """
-    raise NotImplementedError("look_at is not implemented yet")
+    pos = _as_point(pos, what="pos")
+    target = _as_point(target, what="target")
+    up_hint = _as_point(up, what="up")
+
+    forward = _normalize(_sub(target, pos), what="view direction")
+    right = _normalize(
+        _cross(up_hint, forward),
+        what="right vector (up hint may be parallel to the view direction)",
+    )
+    up_out = _normalize(_cross(forward, right), what="recomputed up")
+
+    matrix = [
+        [right[0], right[1], right[2], -_dot(right, pos)],
+        [up_out[0], up_out[1], up_out[2], -_dot(up_out, pos)],
+        [forward[0], forward[1], forward[2], -_dot(forward, pos)],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+    return {
+        "position": pos,
+        "forward": forward,
+        "right": right,
+        "up": up_out,
+        "matrix": matrix,
+    }
 
 
 def arc_length(samples):
@@ -88,7 +244,21 @@ def arc_length(samples):
     Raises :class:`CameraPathError` when there are fewer than two samples, a
     coordinate is not finite, or a segment has zero length.
     """
-    raise NotImplementedError("arc_length is not implemented yet")
+    pts = [_as_point(p, what="sample") for p in samples]
+    if len(pts) < 2:
+        raise CameraPathError(
+            f"arc_length needs at least two samples, got {len(pts)}"
+        )
+
+    lengths = [0.0]
+    for i in range(1, len(pts)):
+        segment = _norm(_sub(pts[i], pts[i - 1]))
+        if segment <= TOLERANCE:
+            raise CameraPathError(
+                f"zero-length segment between samples {i - 1} and {i}"
+            )
+        lengths.append(lengths[-1] + segment)
+    return lengths
 
 
 def resample_uniform(samples, count):
@@ -102,7 +272,32 @@ def resample_uniform(samples, count):
     Raises :class:`CameraPathError` when ``count < 2``, when ``samples`` has
     fewer than two positions, or when the total arc length is zero.
     """
-    raise NotImplementedError("resample_uniform is not implemented yet")
+    if not isinstance(count, int) or isinstance(count, bool) or count < 2:
+        raise CameraPathError(f"count must be an integer of at least 2, got {count!r}")
+    pts = [_as_point(p, what="sample") for p in samples]
+    if len(pts) < 2:
+        raise CameraPathError(
+            f"resample_uniform needs at least two samples, got {len(pts)}"
+        )
+
+    lengths = arc_length(pts)
+    total = lengths[-1]
+    if total <= TOLERANCE:
+        raise CameraPathError("total arc length is zero; cannot resample")
+
+    spacing = total / (count - 1)
+    output = [pts[0]]
+    seg = 0  # segment index such that target distance falls in (lengths[seg], lengths[seg+1]]
+    for k in range(1, count - 1):
+        target_dist = spacing * k
+        while seg < len(pts) - 2 and lengths[seg + 1] < target_dist:
+            seg += 1
+        seg_start = lengths[seg]
+        seg_len = lengths[seg + 1] - seg_start
+        frac = (target_dist - seg_start) / seg_len
+        output.append(_add(pts[seg], _scale(_sub(pts[seg + 1], pts[seg]), frac)))
+    output.append(pts[-1])
+    return output
 
 
 def speed_profile(samples, ease):
@@ -117,7 +312,21 @@ def speed_profile(samples, ease):
     Raises :class:`CameraPathError` when there are fewer than two samples or
     when ``ease`` is not one of the supported strings.
     """
-    raise NotImplementedError("speed_profile is not implemented yet")
+    pts = list(samples)
+    if len(pts) < 2:
+        raise CameraPathError(
+            f"speed_profile needs at least two samples, got {len(pts)}"
+        )
+    if ease not in ("smooth", "linear"):
+        raise CameraPathError(
+            f"unsupported ease {ease!r}; expected 'smooth' or 'linear'"
+        )
+
+    n = len(pts)
+    if ease == "linear":
+        return [1.0] * n
+    # Smooth: sinusoidal ease-in/ease-out, 0 at both ends, 1.0 in the middle.
+    return [math.sin(math.pi * i / (n - 1)) for i in range(n)]
 
 
 def validate(points, samples):
@@ -130,7 +339,34 @@ def validate(points, samples):
     coordinates in either input.  Messages contain stable keywords such as
     ``"fewer than two"``, ``"duplicate"`` and ``"non-finite"``.
     """
-    raise NotImplementedError("validate is not implemented yet")
+    problems = []
+
+    pts = list(points) if points is not None else []
+    if len(pts) < 2:
+        problems.append(
+            f"fewer than two control points ({len(pts)} given)"
+        )
+
+    coerced = []
+    for i, p in enumerate(pts):
+        try:
+            coerced.append(_as_point(p, what="control point"))
+        except CameraPathError:
+            problems.append(f"non-finite coordinate in control point {i}: {p!r}")
+    for i in range(len(coerced)):
+        for j in range(i + 1, len(coerced)):
+            if _norm(_sub(coerced[i], coerced[j])) <= TOLERANCE:
+                problems.append(
+                    f"duplicate control points at indices {i} and {j}"
+                )
+
+    for i, p in enumerate(samples or []):
+        try:
+            _as_point(p, what="sample")
+        except CameraPathError:
+            problems.append(f"non-finite coordinate in sample {i}: {p!r}")
+
+    return problems
 
 
 def path_batch(paths, config):
@@ -160,4 +396,46 @@ def path_batch(paths, config):
     the whole call raises :class:`CameraPathError` and leaves the input
     structures untouched (atomic rollback).
     """
-    raise NotImplementedError("path_batch is not implemented yet")
+    if not isinstance(config, dict):
+        raise CameraPathError("config must be a dict")
+    samples_count = config.get("samples")
+    if (
+        not isinstance(samples_count, int)
+        or isinstance(samples_count, bool)
+        or samples_count < 2
+    ):
+        raise CameraPathError(
+            f"config['samples'] must be an integer of at least 2, got {samples_count!r}"
+        )
+    ease = config.get("ease", "smooth")
+    if ease not in ("smooth", "linear"):
+        raise CameraPathError(
+            f"unsupported ease {ease!r}; expected 'smooth' or 'linear'"
+        )
+
+    entries = list(paths)
+
+    # Phase 1: validate everything before building any output (atomic).
+    validated = []
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict) or "points" not in entry:
+            raise CameraPathError(f"path {i} must be a dict with a 'points' key")
+        pts = _check_points(entry["points"], what=f"path {i} control points")
+        validated.append((entry.get("name"), pts))
+
+    # Phase 2: build independent buffers per path.
+    out_paths = []
+    for name, pts in validated:
+        sampled = catmull_rom(pts, samples_count)
+        tangents = [tangent_at(sampled, i) for i in range(len(sampled))]
+        speed = speed_profile(sampled, ease)
+        out_paths.append(
+            {
+                "name": name,
+                "samples": list(sampled),
+                "tangents": list(tangents),
+                "speed": list(speed),
+            }
+        )
+
+    return {"paths": out_paths, "count": len(out_paths)}
